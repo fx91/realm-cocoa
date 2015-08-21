@@ -18,16 +18,12 @@
 
 #include "realm_coordinator.hpp"
 
+#include "cached_realm.hpp"
 #include "external_commit_helper.hpp"
 #include "object_store.hpp"
 
 using namespace realm;
 using namespace realm::_impl;
-
-struct realm::_impl::CachedRealm {
-    std::weak_ptr<Realm> realm;
-    std::thread::id thread_id;
-};
 
 static std::mutex s_coordinator_mutex;
 static std::map<std::string, std::weak_ptr<RealmCoordinator>> s_coordinators_per_path;
@@ -87,13 +83,12 @@ std::shared_ptr<Realm> RealmCoordinator::get_realm(Realm::Config config)
         }
     }
 
-    auto thread_id = std::this_thread::get_id();
     if (config.cache) {
         for (auto& cachedRealm : m_cached_realms) {
-            if (cachedRealm.thread_id == thread_id) {
+            if (cachedRealm.is_cached_for_current_thread()) {
                 // can be null if we jumped in between ref count hitting zero and
                 // unregister_realm() getting the lock
-                if (auto realm = cachedRealm.realm.lock()) {
+                if (auto realm = cachedRealm.realm()) {
                     return realm;
                 }
             }
@@ -102,10 +97,7 @@ std::shared_ptr<Realm> RealmCoordinator::get_realm(Realm::Config config)
 
     auto realm = std::make_shared<Realm>(config);
     realm->init(shared_from_this());
-    m_notifier->add_realm(realm.get());
-    if (config.cache) {
-        m_cached_realms.push_back({realm, thread_id});
-    }
+    m_cached_realms.emplace_back(realm, m_config.cache);
     return realm;
 }
 
@@ -129,12 +121,11 @@ RealmCoordinator::~RealmCoordinator()
     }
 }
 
-void RealmCoordinator::unregister_realm(Realm* realm)
+void RealmCoordinator::unregister_realm(Realm*)
 {
     std::lock_guard<std::mutex> lock(m_realm_mutex);
-    m_notifier->remove_realm(realm);
     for (size_t i = 0; i < m_cached_realms.size(); ++i) {
-        if (m_cached_realms[i].realm.expired()) {
+        if (m_cached_realms[i].expired()) {
             if (i + 1 < m_cached_realms.size()) {
                 m_cached_realms[i] = std::move(m_cached_realms.back());
             }
@@ -158,7 +149,7 @@ void RealmCoordinator::clear_cache()
             }
 
             for (auto& cached_realm : coordinator->m_cached_realms) {
-                if (auto realm = cached_realm.realm.lock()) {
+                if (auto realm = cached_realm.realm()) {
                     realms_to_close.push_back(realm);
                 }
             }
@@ -177,4 +168,12 @@ void RealmCoordinator::clear_cache()
 void RealmCoordinator::send_commit_notifications()
 {
     m_notifier->notify_others();
+}
+
+void RealmCoordinator::on_change()
+{
+    std::lock_guard<std::mutex> lock(m_realm_mutex);
+    for (auto& realm : m_cached_realms) {
+        realm.notify();
+    }
 }
