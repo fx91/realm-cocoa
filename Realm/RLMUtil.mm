@@ -299,6 +299,9 @@ void RLMSetErrorOrThrow(NSError *error, NSError **outError) {
         *outError = error;
     }
     else {
+        if (error.userInfo[NSFilePathErrorKey]) {
+            @throw RLMException(@"%@: %@", error.userInfo[NSFilePathErrorKey], error.localizedDescription);
+        }
         @throw RLMException(@"%@", error.localizedDescription);
     }
 }
